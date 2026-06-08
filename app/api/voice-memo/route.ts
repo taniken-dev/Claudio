@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
     // Step 2: GPT-4o で要約・整理
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
-      max_tokens: 1024,
+      max_tokens: 1500,
       messages: [
         {
           role: "system",
@@ -41,6 +41,12 @@ export async function POST(req: NextRequest) {
           content: `以下の文字起こしテキストを整理してください。
 誤認識と思われる単語は文脈から正しい単語に修正すること。
 
+【話者整理の発言内容について】
+・対比できる概念が出てきた場合は箇条書きで対比して整理する
+・手順・ステップ・列挙が3つ以上ある場合は箇条書きにする
+・それ以外の説明は段落で記載する
+・内容に応じて自動判断し、無条件に箇条書きにしないこと
+
 出力は必ず以下のフォーマットを厳守すること。
 マークダウンの記号（**や--）はそのまま出力しないこと。
 
@@ -48,10 +54,10 @@ export async function POST(req: NextRequest) {
 🎙️ 話者整理
 
 [話者名]（役割）
-発言内容を整理して段落で記載。箇条書きは内容の列挙が必要な場合のみ使う。
+発言内容
 
 [話者名]（役割）
-発言内容を整理して段落で記載。
+発言内容
 
 ---
 ✨ 要約
@@ -64,6 +70,11 @@ export async function POST(req: NextRequest) {
 📌 アクションアイテム（あれば）
 
 ・内容
+
+---
+📌 キーワードタグ
+
+キーワード1, キーワード2, キーワード3
 ---
 
 話者名が含まれる場合はそれを使用。ない場合は話者A・話者Bとする。
@@ -75,6 +86,7 @@ ${transcript}`,
     });
 
     const summary = completion.choices[0]?.message?.content?.trim() ?? "";
+    const keywords = extractKeywords(summary);
 
     // Step 3: Notion に子ページとして保存
     const pageId = process.env.NOTION_PAGE_ID;
@@ -104,21 +116,39 @@ ${transcript}`,
         },
         children: [
           {
-            type: "heading_2",
-            heading_2: {
-              rich_text: [{ type: "text", text: { content: "📝 文字起こし" } }],
-            },
-          },
-          {
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: transcript } }],
+            type: "toggle",
+            toggle: {
+              rich_text: [{ type: "text", text: { content: "📝 文字起こし全文（タップで展開）" } }],
+              children: [
+                {
+                  type: "paragraph",
+                  paragraph: {
+                    rich_text: [{ type: "text", text: { content: transcript } }],
+                  },
+                },
+              ],
             },
           },
           { type: "divider", divider: {} },
           ...buildNotionBlocks(summary),
         ],
       });
+
+      // タグをmulti_selectプロパティとして保存（データベースページの場合のみ有効）
+      if (keywords.length > 0) {
+        try {
+          await notion.pages.update({
+            page_id: newPage.id,
+            properties: {
+              タグ: {
+                multi_select: keywords.map((k) => ({ name: k })),
+              },
+            },
+          });
+        } catch {
+          // 親がデータベースでない場合はスキップ
+        }
+      }
 
       notionUrl = `https://notion.so/${newPage.id.replace(/-/g, "")}`;
     }
@@ -129,6 +159,21 @@ ${transcript}`,
     const message = err instanceof Error ? err.message : "サーバーエラー";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+function extractKeywords(summary: string): string[] {
+  const lines = summary.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes("キーワードタグ")) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const candidate = lines[j].trim();
+        if (candidate && !/^[-—―]+$/.test(candidate) && !candidate.startsWith("📌")) {
+          return candidate.split(",").map((k) => k.trim()).filter((k) => k.length > 0);
+        }
+      }
+    }
+  }
+  return [];
 }
 
 async function resolveUniqueTitle(pageId: string, baseTitle: string): Promise<string> {
@@ -174,13 +219,13 @@ function buildNotionBlocks(summary: string) {
     if (!line) continue;
 
     // 区切り線
-    if (/^-{2,}$/.test(line)) {
+    if (/^[-—―]{2,}$/.test(line)) {
       blocks.push({ type: "divider", divider: {} });
       continue;
     }
 
     // セクション見出し（🎙️ / ✨ / 📌）
-    if (/^[🎙️✨📌]/.test(line)) {
+    if (/^[🎙✨📌]/.test(line)) {
       inSpeakerSection = line.startsWith("🎙");
       blocks.push({ type: "heading_2", heading_2: { rich_text: [{ type: "text", text: { content: line } }] } });
       continue;
