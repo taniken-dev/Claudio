@@ -10,6 +10,7 @@
   "dependencies": {
     "@notionhq/client": "^2.2.15",
     "next": "^15.3.3",
+    "next-auth": "^5.0.0-beta.31",
     "openai": "^4.103.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
