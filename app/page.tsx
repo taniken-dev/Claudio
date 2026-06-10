@@ -8,6 +8,7 @@ interface Result {
   transcript: string;
   summary: string;
   notionUrl?: string;
+  summaryFailed?: boolean;
 }
 
 export default function Home() {
@@ -26,7 +27,10 @@ export default function Home() {
         ? "audio/webm;codecs=opus"
         : "audio/webm";
 
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const recorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: 32000,
+      });
       chunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
@@ -140,6 +144,13 @@ export default function Home() {
             <p style={styles.text}>{result.transcript}</p>
           </section>
 
+          {result.summaryFailed && (
+            <div style={styles.warnBox}>
+              ⚠️ 要約の生成に失敗しました。文字起こしのみNotionに保存されています。
+            </div>
+          )}
+
+          {!result.summaryFailed && (
           <section style={styles.section}>
             <h2 style={styles.sectionTitle}>✨ 要約</h2>
             <div style={styles.text}>
@@ -150,6 +161,7 @@ export default function Home() {
               ))}
             </div>
           </section>
+          )}
 
           {result.notionUrl && (
             <p style={styles.notionLink}>
@@ -243,6 +255,14 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 14,
     margin: "4px 0 0",
     animation: "pulse 1.2s ease-in-out infinite",
+  },
+  warnBox: {
+    background: "#fffbeb",
+    border: "1px solid #fcd34d",
+    borderRadius: 8,
+    padding: "12px 16px",
+    color: "#92400e",
+    fontSize: 14,
   },
   errorBox: {
     background: "#fff5f5",

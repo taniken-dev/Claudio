@@ -27,18 +27,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "音声から文字を認識できませんでした。" }, { status: 422 });
     }
 
-    // Step 2: GPT-4o で要約・整理
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      max_tokens: 1500,
-      messages: [
-        {
-          role: "system",
-          content: "あなたは日本語の音声メモを整理するアシスタントです。",
-        },
-        {
-          role: "user",
-          content: `以下の文字起こしテキストを整理してください。
+    // Step 2: GPT-4o で要約・整理（失敗しても文字起こしは保存する）
+    let summary = "";
+    let keywords: string[] = [];
+    let summaryFailed = false;
+
+    try {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
+        max_tokens: 1500,
+        messages: [
+          {
+            role: "system",
+            content: "あなたは日本語の音声メモを整理するアシスタントです。",
+          },
+          {
+            role: "user",
+            content: `以下の文字起こしテキストを整理してください。
 誤認識と思われる単語は文脈から正しい単語に修正すること。
 
 【話者整理の発言内容について】
@@ -81,12 +86,16 @@ export async function POST(req: NextRequest) {
 
 【文字起こし】
 ${transcript}`,
-        },
-      ],
-    });
+          },
+        ],
+      });
 
-    const summary = completion.choices[0]?.message?.content?.trim() ?? "";
-    const keywords = extractKeywords(summary);
+      summary = completion.choices[0]?.message?.content?.trim() ?? "";
+      keywords = extractKeywords(summary);
+    } catch (err) {
+      console.error("GPT-4o 要約エラー:", err);
+      summaryFailed = true;
+    }
 
     // Step 3: Notion に子ページとして保存
     const pageId = process.env.NOTION_PAGE_ID;
@@ -115,22 +124,35 @@ ${transcript}`,
           },
         },
         children: [
+          ...(summaryFailed
+            ? [
+                {
+                  type: "callout" as const,
+                  callout: {
+                    rich_text: [{ type: "text" as const, text: { content: "要約に失敗したため、文字起こしのみ保存しています。" } }],
+                    icon: { type: "emoji" as const, emoji: "⚠️" as const },
+                  },
+                },
+              ]
+            : []),
           {
-            type: "toggle",
+            type: "toggle" as const,
             toggle: {
-              rich_text: [{ type: "text", text: { content: "📝 文字起こし全文（タップで展開）" } }],
+              rich_text: [{ type: "text" as const, text: { content: "📝 文字起こし全文（タップで展開）" } }],
               children: [
                 {
-                  type: "paragraph",
+                  type: "paragraph" as const,
                   paragraph: {
-                    rich_text: [{ type: "text", text: { content: transcript } }],
+                    rich_text: [{ type: "text" as const, text: { content: transcript } }],
                   },
                 },
               ],
             },
           },
-          { type: "divider", divider: {} },
-          ...buildNotionBlocks(summary),
+          ...(summaryFailed ? [] : [
+            { type: "divider" as const, divider: {} as Record<string, never> },
+            ...buildNotionBlocks(summary),
+          ]),
         ],
       });
 
@@ -153,7 +175,7 @@ ${transcript}`,
       notionUrl = `https://notion.so/${newPage.id.replace(/-/g, "")}`;
     }
 
-    return NextResponse.json({ transcript, summary, notionUrl });
+    return NextResponse.json({ transcript, summary, notionUrl, summaryFailed });
   } catch (err) {
     console.error(err);
     const message = err instanceof Error ? err.message : "サーバーエラー";
