@@ -85,6 +85,25 @@ export default function Home() {
     setStatus("processing");
   };
 
+  const cancelRecording = () => {
+    if (!window.confirm("録音を破棄しますか？")) return;
+
+    const recorder = mediaRecorderRef.current;
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (recorder) {
+      recorder.onstop = () => {
+        recorder.stream.getTracks().forEach((t) => t.stop());
+      };
+      recorder.stop();
+    }
+    chunksRef.current = [];
+    setStatus("idle");
+    setElapsed(0);
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -165,9 +184,14 @@ export default function Home() {
         )}
 
         {isRecording && (
-          <button onClick={stopRecording} style={styles.stopBtn}>
-            ■ 録音停止
-          </button>
+          <>
+            <button onClick={stopRecording} style={styles.stopBtn}>
+              ■ 録音停止
+            </button>
+            <button onClick={cancelRecording} style={styles.cancelBtn}>
+              ✕ キャンセル
+            </button>
+          </>
         )}
 
         {isProcessing && (
@@ -372,6 +396,16 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#555",
     cursor: "pointer",
     whiteSpace: "nowrap" as const,
+  },
+  cancelBtn: {
+    background: "transparent",
+    color: "#718096",
+    border: "1px solid #cbd5e0",
+    borderRadius: 8,
+    padding: "14px 24px",
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: "pointer",
   },
   uploadLabel: {
     background: "#fff",
