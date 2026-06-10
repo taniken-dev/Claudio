@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 
 type Status = "idle" | "recording" | "processing" | "done" | "error";
 
@@ -11,14 +11,30 @@ interface Result {
   summaryFailed?: boolean;
 }
 
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [result, setResult] = useState<Result | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [title, setTitle] = useState<string>("");
+  const [elapsed, setElapsed] = useState(0);
+  const [copied, setCopied] = useState<"transcript" | "summary" | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
 
   const startRecording = async () => {
     try {
@@ -39,6 +55,8 @@ export default function Home() {
 
       recorder.start(100);
       mediaRecorderRef.current = recorder;
+      setElapsed(0);
+      timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
       setStatus("recording");
       setResult(null);
       setErrorMessage("");
@@ -52,6 +70,11 @@ export default function Home() {
     const recorder = mediaRecorderRef.current;
     if (!recorder) return;
 
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+
     recorder.onstop = async () => {
       const blob = new Blob(chunksRef.current, { type: recorder.mimeType });
       recorder.stream.getTracks().forEach((t) => t.stop());
@@ -60,6 +83,22 @@ export default function Home() {
 
     recorder.stop();
     setStatus("processing");
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    setResult(null);
+    setErrorMessage("");
+    setStatus("processing");
+    await processAudio(file);
+  };
+
+  const copyToClipboard = async (text: string, key: "transcript" | "summary") => {
+    await navigator.clipboard.writeText(text);
+    setCopied(key);
+    setTimeout(() => setCopied(null), 2000);
   };
 
   const processAudio = async (audioBlob: Blob) => {
@@ -108,9 +147,21 @@ export default function Home() {
 
       <div style={styles.buttonArea}>
         {!isRecording && !isProcessing && (
-          <button onClick={startRecording} style={styles.recordBtn}>
-            ● 録音開始
-          </button>
+          <>
+            <button onClick={startRecording} style={styles.recordBtn}>
+              ● 録音開始
+            </button>
+            <label style={styles.uploadLabel}>
+              ファイルを選択
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                onChange={handleFileUpload}
+                style={{ display: "none" }}
+              />
+            </label>
+          </>
         )}
 
         {isRecording && (
@@ -128,7 +179,7 @@ export default function Home() {
       </div>
 
       {isRecording && (
-        <p style={styles.recordingIndicator}>● 録音中</p>
+        <p style={styles.recordingIndicator}>● 録音中　{formatTime(elapsed)}</p>
       )}
 
       {status === "error" && (
@@ -140,7 +191,15 @@ export default function Home() {
       {result && (
         <div style={styles.resultArea}>
           <section style={styles.section}>
-            <h2 style={styles.sectionTitle}>📝 文字起こし</h2>
+            <div style={styles.sectionHeader}>
+              <h2 style={styles.sectionTitle}>📝 文字起こし</h2>
+              <button
+                onClick={() => copyToClipboard(result.transcript, "transcript")}
+                style={styles.copyBtn}
+              >
+                {copied === "transcript" ? "✓ コピー済み" : "コピー"}
+              </button>
+            </div>
             <p style={styles.text}>{result.transcript}</p>
           </section>
 
@@ -152,7 +211,15 @@ export default function Home() {
 
           {!result.summaryFailed && (
           <section style={styles.section}>
-            <h2 style={styles.sectionTitle}>✨ 要約</h2>
+            <div style={styles.sectionHeader}>
+              <h2 style={styles.sectionTitle}>✨ 要約</h2>
+              <button
+                onClick={() => copyToClipboard(result.summary, "summary")}
+                style={styles.copyBtn}
+              >
+                {copied === "summary" ? "✓ コピー済み" : "コピー"}
+              </button>
+            </div>
             <div style={styles.text}>
               {result.summary.split("\n").map((line, i) => (
                 <p key={i} style={{ margin: "4px 0" }}>
@@ -284,11 +351,37 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "20px 24px",
     borderLeft: "4px solid #4a90d9",
   },
+  sectionHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
   sectionTitle: {
     fontSize: 16,
     fontWeight: 700,
-    margin: "0 0 12px",
+    margin: 0,
     color: "#2d3748",
+  },
+  copyBtn: {
+    background: "transparent",
+    border: "1px solid #cbd5e0",
+    borderRadius: 6,
+    padding: "4px 10px",
+    fontSize: 13,
+    color: "#555",
+    cursor: "pointer",
+    whiteSpace: "nowrap" as const,
+  },
+  uploadLabel: {
+    background: "#fff",
+    color: "#2d3748",
+    border: "1px solid #cbd5e0",
+    borderRadius: 8,
+    padding: "14px 24px",
+    fontSize: 15,
+    fontWeight: 500,
+    cursor: "pointer",
   },
   text: {
     fontSize: 15,
