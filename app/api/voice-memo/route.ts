@@ -139,14 +139,7 @@ ${transcript}`,
             type: "toggle" as const,
             toggle: {
               rich_text: [{ type: "text" as const, text: { content: "📝 文字起こし全文（タップで展開）" } }],
-              children: [
-                {
-                  type: "paragraph" as const,
-                  paragraph: {
-                    rich_text: [{ type: "text" as const, text: { content: transcript } }],
-                  },
-                },
-              ],
+              children: splitIntoParagraphs(transcript),
             },
           },
           ...(summaryFailed ? [] : [
@@ -181,6 +174,21 @@ ${transcript}`,
     const message = err instanceof Error ? err.message : "サーバーエラー";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+function splitIntoParagraphs(text: string, maxLen = 2000) {
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    chunks.push(remaining.slice(0, maxLen));
+    remaining = remaining.slice(maxLen);
+  }
+  return chunks.map((chunk) => ({
+    type: "paragraph" as const,
+    paragraph: {
+      rich_text: [{ type: "text" as const, text: { content: chunk } }],
+    },
+  }));
 }
 
 function extractKeywords(summary: string): string[] {
