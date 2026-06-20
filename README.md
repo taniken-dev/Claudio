@@ -4,14 +4,20 @@
 
 ## 機能
 
-- ブラウザでマイク録音（MediaRecorder API）
+- Googleアカウントによるログイン認証（許可したメールアドレスのみアクセス可）
+- ブラウザでマイク録音（MediaRecorder API）・録音タイマー表示
+- 音声ファイルのアップロードにも対応（mp3 / m4a / webm など）
+- 録音中のキャンセル（確認ダイアログあり）
 - OpenAI Whisper による日本語文字起こし
 - GPT-4o による話者整理・要約・アクションアイテム抽出・キーワードタグ生成
+- 文字起こし・要約のワンクリックコピー
 - Notion の指定ページに子ページとして自動保存
+- 長時間録音（文字起こし全文を2000文字ごとに分割してNotion保存）
 
 ## 技術スタック
 
 - **フロントエンド**: Next.js 15 (App Router) / TypeScript / React 19
+- **認証**: NextAuth.js v5 / Google OAuth 2.0
 - **文字起こし**: OpenAI Whisper API (`whisper-1`)
 - **要約**: OpenAI GPT-4o
 - **保存先**: Notion API (`@notionhq/client`)
@@ -43,6 +49,15 @@ cp .env.local.example .env.local
 OPENAI_API_KEY=sk-...
 NOTION_API_KEY=secret_...
 NOTION_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+GOOGLE_CLIENT_ID=xxxxxxxxxxxx.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxxxxxxxxxxx
+
+AUTH_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ALLOWED_EMAIL=your@gmail.com
+
+# Vercel本番環境のみ必要
+AUTH_URL=https://your-app.vercel.app
 ```
 
 | 変数名 | 説明 |
@@ -50,8 +65,22 @@ NOTION_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | `OPENAI_API_KEY` | OpenAI APIキー（Whisper・GPT-4o に使用） |
 | `NOTION_API_KEY` | Notion インテグレーションのAPIキー |
 | `NOTION_PAGE_ID` | 保存先ページのID（URLの末尾32文字） |
+| `GOOGLE_CLIENT_ID` | Google OAuth クライアントID |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth クライアントシークレット |
+| `AUTH_SECRET` | NextAuth 署名用シークレット（`openssl rand -base64 32` で生成） |
+| `ALLOWED_EMAIL` | アクセスを許可するGoogleアカウントのメールアドレス |
+| `AUTH_URL` | Vercel 本番環境のURL（デプロイ時のみ必要） |
 
-### 4. Notion の設定
+### 4. Google OAuth の設定
+
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成
+2. 「APIとサービス」→「認証情報」→「OAuthクライアントID」を作成（種別: ウェブアプリケーション）
+3. 承認済みリダイレクトURIに以下を追加：
+   - ローカル: `http://localhost:3000/api/auth/callback/google`
+   - 本番: `https://your-app.vercel.app/api/auth/callback/google`
+4. 取得した クライアントID・シークレットを `.env.local` に設定
+
+### 5. Notion の設定
 
 1. [Notion Integrations](https://www.notion.so/my-integrations) でインテグレーションを作成
 2. 保存先ページを開き、「接続を追加」でインテグレーションを接続
@@ -60,7 +89,7 @@ NOTION_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 > **キーワードタグのmulti_select保存について**  
 > 保存先が Notion データベースの場合、`タグ` プロパティにキーワードが multi_select で自動保存されます。通常のページの場合はページ本文内に記載されます。
 
-### 5. 起動
+### 6. 起動
 
 ```bash
 npm run dev
@@ -70,11 +99,14 @@ npm run dev
 
 ## 使い方
 
-1. タイトルを入力（省略可）
-2. 「録音開始」ボタンを押してマイクを許可
-3. 話す
-4. 「録音停止」を押すと自動で処理開始
+1. Googleアカウントでログイン（`ALLOWED_EMAIL` に設定したアカウントのみ可）
+2. タイトルを入力（省略可）
+3. **「録音開始」** を押してマイクを許可 → 録音タイマーが表示される
+   - 録音中に **「キャンセル」** を押すと確認後に破棄
+   - 音声ファイルがある場合は **「ファイルを選択」** からアップロードも可能
+4. **「録音停止」** を押すと自動で処理開始
 5. 文字起こし・要約が画面に表示され、Notionに保存される
+   - 各テキストはコピーボタンでクリップボードにコピー可能
 
 ### Notion 保存フォーマット
 
