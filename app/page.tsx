@@ -29,6 +29,9 @@ export default function Home() {
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const displayStreamRef = useRef<MediaStream | null>(null);
+  const [audioMode, setAudioMode] = useState<"mic-only" | "mixed">("mic-only");
 
   useEffect(() => {
     return () => {
@@ -38,12 +41,48 @@ export default function Home() {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      let recordStream = micStream;
+      let mixed = false;
+
+      try {
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+        // ビデオトラックは不要なので即停止
+        displayStream.getVideoTracks().forEach((t) => t.stop());
+
+        const sysAudioTracks = displayStream.getAudioTracks();
+        if (sysAudioTracks.length > 0) {
+          const ctx = new AudioContext();
+          audioContextRef.current = ctx;
+          displayStreamRef.current = displayStream;
+
+          const micSource = ctx.createMediaStreamSource(micStream);
+          const sysSource = ctx.createMediaStreamSource(displayStream);
+          const dest = ctx.createMediaStreamDestination();
+          micSource.connect(dest);
+          sysSource.connect(dest);
+
+          recordStream = dest.stream;
+          mixed = true;
+        } else {
+          // ユーザーがオーディオ共有をオフにした場合はマイクのみ
+          displayStream.getTracks().forEach((t) => t.stop());
+        }
+      } catch {
+        // getDisplayMedia キャンセル or 非対応 → マイクのみで続行
+      }
+
+      setAudioMode(mixed ? "mixed" : "mic-only");
+
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
 
-      const recorder = new MediaRecorder(stream, {
+      const recorder = new MediaRecorder(recordStream, {
         mimeType,
         audioBitsPerSecond: 32000,
       });
@@ -55,6 +94,8 @@ export default function Home() {
 
       recorder.start(100);
       mediaRecorderRef.current = recorder;
+      // マイクストリームを recorder に紐付けて停止時に使えるよう保持
+      (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream = micStream;
       setElapsed(0);
       timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
       setStatus("recording");
@@ -64,6 +105,13 @@ export default function Home() {
       setErrorMessage("マイクへのアクセスが拒否されました。");
       setStatus("error");
     }
+  };
+
+  const cleanupAudio = () => {
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    displayStreamRef.current?.getTracks().forEach((t) => t.stop());
+    displayStreamRef.current = null;
   };
 
   const stopRecording = () => {
@@ -77,7 +125,10 @@ export default function Home() {
 
     recorder.onstop = async () => {
       const blob = new Blob(chunksRef.current, { type: recorder.mimeType });
-      recorder.stream.getTracks().forEach((t) => t.stop());
+      (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream
+        ?.getTracks()
+        .forEach((t) => t.stop());
+      cleanupAudio();
       await processAudio(blob);
     };
 
@@ -95,7 +146,10 @@ export default function Home() {
     }
     if (recorder) {
       recorder.onstop = () => {
-        recorder.stream.getTracks().forEach((t) => t.stop());
+        (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream
+          ?.getTracks()
+          .forEach((t) => t.stop());
+        cleanupAudio();
       };
       recorder.stop();
     }
@@ -203,7 +257,18 @@ export default function Home() {
       </div>
 
       {isRecording && (
-        <p style={styles.recordingIndicator}>● 録音中　{formatTime(elapsed)}</p>
+        <div>
+          <p style={styles.recordingIndicator}>● 録音中　{formatTime(elapsed)}</p>
+          <p style={styles.audioModeLabel}>
+            {audioMode === "mixed" ? "🎧 マイク + PC内部音声" : "🎤 マイクのみ"}
+          </p>
+        </div>
+      )}
+
+      {status === "idle" && (
+        <p style={styles.hint}>
+          録音開始後、ブラウザの共有ダイアログでタブまたは画面を選択し「オーディオを共有」を有効にするとPC音声も録音されます。
+        </p>
       )}
 
       {status === "error" && (
@@ -427,5 +492,16 @@ const styles: Record<string, React.CSSProperties> = {
   notionLink: {
     textAlign: "right",
     margin: 0,
+  },
+  audioModeLabel: {
+    fontSize: 13,
+    color: "#4a5568",
+    margin: "2px 0 0",
+  },
+  hint: {
+    fontSize: 13,
+    color: "#888",
+    margin: "8px 0 0",
+    lineHeight: 1.6,
   },
 };
