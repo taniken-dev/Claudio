@@ -9,6 +9,8 @@ type Status = "idle" | "recording" | "processing" | "done" | "error";
 // Whisper（whisper-1）のファイル上限。約30kbpsの録音で約118分に相当する。
 const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
 
+const SOURCE_PREF_KEY = "claudio.audioSources";
+
 interface Result {
   transcript: string;
   summary: string;
@@ -41,7 +43,11 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const displayStreamRef = useRef<MediaStream | null>(null);
-  const [audioMode, setAudioMode] = useState<"mic-only" | "mixed">("mic-only");
+  const micStreamRef = useRef<MediaStream | null>(null);
+
+  // 録音する音源の選択。両方ONならミックス、PC音声のみも選べる。
+  const [useMic, setUseMic] = useState(true);
+  const [useSystem, setUseSystem] = useState(true);
 
   useEffect(() => {
     return () => {
@@ -49,44 +55,82 @@ export default function Home() {
     };
   }, []);
 
-  const startRecording = async () => {
+  // 前回の選択を復元する。SSRとの不一致を避けるためマウント後に読む。
+  useEffect(() => {
+    const saved = localStorage.getItem(SOURCE_PREF_KEY);
+    if (!saved) return;
     try {
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const { mic, system } = JSON.parse(saved) as { mic: boolean; system: boolean };
+      // 両方オフだと録音できないので、その状態は復元しない
+      if (typeof mic === "boolean" && typeof system === "boolean" && (mic || system)) {
+        setUseMic(mic);
+        setUseSystem(system);
+      }
+    } catch {
+      // 壊れていたら既定値のまま
+    }
+  }, []);
 
-      let recordStream = micStream;
-      let mixed = false;
+  useEffect(() => {
+    localStorage.setItem(SOURCE_PREF_KEY, JSON.stringify({ mic: useMic, system: useSystem }));
+  }, [useMic, useSystem]);
 
+  // 選択された音源だけを取得して、録音対象のストリームを組み立てる。
+  // 単一音源のときは AudioContext を経由せず、そのまま MediaRecorder に渡す。
+  const buildRecordStream = async (): Promise<MediaStream> => {
+    if (useMic) {
       try {
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch {
+        throw new Error("マイクへのアクセスが拒否されました。");
+      }
+    }
+
+    if (useSystem) {
+      let displayStream: MediaStream;
+      try {
+        // 音声のみの getDisplayMedia は多くのブラウザで通らないため video も要求し、
+        // 取得後すぐビデオトラックを止める。
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
         });
-        // ビデオトラックは不要なので即停止
-        displayStream.getVideoTracks().forEach((t) => t.stop());
-
-        const sysAudioTracks = displayStream.getAudioTracks();
-        if (sysAudioTracks.length > 0) {
-          const ctx = new AudioContext();
-          audioContextRef.current = ctx;
-          displayStreamRef.current = displayStream;
-
-          const micSource = ctx.createMediaStreamSource(micStream);
-          const sysSource = ctx.createMediaStreamSource(displayStream);
-          const dest = ctx.createMediaStreamDestination();
-          micSource.connect(dest);
-          sysSource.connect(dest);
-
-          recordStream = dest.stream;
-          mixed = true;
-        } else {
-          // ユーザーがオーディオ共有をオフにした場合はマイクのみ
-          displayStream.getTracks().forEach((t) => t.stop());
-        }
       } catch {
-        // getDisplayMedia キャンセル or 非対応 → マイクのみで続行
+        throw new Error("画面共有がキャンセルされました。PC内部音声を録音するには共有の許可が必要です。");
       }
 
-      setAudioMode(mixed ? "mixed" : "mic-only");
+      displayStream.getVideoTracks().forEach((t) => t.stop());
+
+      if (displayStream.getAudioTracks().length === 0) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        throw new Error(
+          "音声が共有されていません。共有ダイアログで「タブの音声を共有」を有効にしてください。"
+        );
+      }
+
+      displayStreamRef.current = displayStream;
+    }
+
+    const mic = micStreamRef.current;
+    const sys = displayStreamRef.current;
+
+    if (mic && sys) {
+      const ctx = new AudioContext();
+      audioContextRef.current = ctx;
+      const dest = ctx.createMediaStreamDestination();
+      ctx.createMediaStreamSource(mic).connect(dest);
+      ctx.createMediaStreamSource(sys).connect(dest);
+      return dest.stream;
+    }
+
+    return (mic ?? sys)!;
+  };
+
+  const startRecording = async () => {
+    if (!useMic && !useSystem) return;
+
+    try {
+      const recordStream = await buildRecordStream();
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
@@ -104,25 +148,29 @@ export default function Home() {
 
       recorder.start(100);
       mediaRecorderRef.current = recorder;
-      // マイクストリームを recorder に紐付けて停止時に使えるよう保持
-      (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream = micStream;
       setElapsed(0);
       timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
       setStatus("recording");
       setResult(null);
       setErrorMessage("");
       setBlobWarning("");
-    } catch {
-      setErrorMessage("マイクへのアクセスが拒否されました。");
+    } catch (err) {
+      // 途中まで取得したストリームを残さない
+      cleanupAudio();
+      setErrorMessage(err instanceof Error ? err.message : "録音を開始できませんでした。");
       setStatus("error");
     }
   };
 
+  // マイク・画面共有・AudioContext をまとめて解放する。
+  // 音源が任意になったので、停止処理は必ずここに集約する。
   const cleanupAudio = () => {
     audioContextRef.current?.close();
     audioContextRef.current = null;
     displayStreamRef.current?.getTracks().forEach((t) => t.stop());
     displayStreamRef.current = null;
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
   };
 
   const stopRecording = () => {
@@ -136,9 +184,6 @@ export default function Home() {
 
     recorder.onstop = async () => {
       const blob = new Blob(chunksRef.current, { type: recorder.mimeType });
-      (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream
-        ?.getTracks()
-        .forEach((t) => t.stop());
       cleanupAudio();
 
       // 文字起こしが失敗しても録音そのものを失わないよう、先に手元へ保存する
@@ -163,12 +208,7 @@ export default function Home() {
       timerRef.current = null;
     }
     if (recorder) {
-      recorder.onstop = () => {
-        (recorder as MediaRecorder & { _micStream?: MediaStream })._micStream
-          ?.getTracks()
-          .forEach((t) => t.stop());
-        cleanupAudio();
-      };
+      recorder.onstop = () => cleanupAudio();
       recorder.stop();
     }
     chunksRef.current = [];
@@ -317,10 +357,39 @@ export default function Home() {
         />
       </div>
 
+      {!isRecording && !isProcessing && (
+        <div style={styles.sourceArea}>
+          <span style={styles.sourceLabel}>録音する音声</span>
+          <label style={styles.sourceOption}>
+            <input
+              type="checkbox"
+              checked={useMic}
+              onChange={(e) => setUseMic(e.target.checked)}
+            />
+            🎤 マイク
+          </label>
+          <label style={styles.sourceOption}>
+            <input
+              type="checkbox"
+              checked={useSystem}
+              onChange={(e) => setUseSystem(e.target.checked)}
+            />
+            🔊 PC内部音声
+          </label>
+        </div>
+      )}
+
       <div style={styles.buttonArea}>
         {!isRecording && !isProcessing && (
           <>
-            <button onClick={startRecording} style={styles.recordBtn}>
+            <button
+              onClick={startRecording}
+              disabled={!useMic && !useSystem}
+              style={{
+                ...styles.recordBtn,
+                ...(!useMic && !useSystem ? styles.recordBtnDisabled : {}),
+              }}
+            >
               ● 録音開始
             </button>
             <label style={styles.uploadLabel}>
@@ -359,14 +428,20 @@ export default function Home() {
         <div>
           <p style={styles.recordingIndicator}>● 録音中　{formatTime(elapsed)}</p>
           <p style={styles.audioModeLabel}>
-            {audioMode === "mixed" ? "🎧 マイク + PC内部音声" : "🎤 マイクのみ"}
+            {useMic && useSystem
+              ? "🎧 マイク + PC内部音声"
+              : useMic
+                ? "🎤 マイクのみ"
+                : "🔊 PC内部音声のみ"}
           </p>
         </div>
       )}
 
       {status === "idle" && (
         <p style={styles.hint}>
-          録音開始後、ブラウザの共有ダイアログでタブまたは画面を選択し「オーディオを共有」を有効にするとPC音声も録音されます。
+          {useSystem
+            ? "録音開始後、ブラウザの共有ダイアログでタブまたは画面を選択し、必ず「タブの音声を共有」を有効にしてください。"
+            : "マイクのみで録音します。PC内部音声も録りたい場合は上のチェックを入れてください。"}
         </p>
       )}
 
@@ -619,6 +694,31 @@ const styles: Record<string, React.CSSProperties> = {
   notionLink: {
     textAlign: "right",
     margin: 0,
+  },
+  sourceArea: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexWrap: "wrap",
+    gap: 16,
+    margin: "0 0 16px",
+  },
+  sourceLabel: {
+    fontSize: 13,
+    color: "#718096",
+  },
+  sourceOption: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 14,
+    color: "#2d3748",
+    cursor: "pointer",
+    userSelect: "none",
+  },
+  recordBtnDisabled: {
+    opacity: 0.45,
+    cursor: "not-allowed",
   },
   audioModeLabel: {
     fontSize: 13,
