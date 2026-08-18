@@ -17,3 +17,8 @@ npm-debug.log*
 node_modules
 .vercel
 .env*
+# テンプレートは追跡する（.env* に巻き込まれるため除外解除）
+!.env.local.example
+
+# TypeScript のビルドキャッシュ（ビルドのたびに差分が出るため追跡しない）
+tsconfig.tsbuildinfo
