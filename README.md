@@ -11,6 +11,10 @@
   - 録音中に現在の音声モード（ミックス or マイクのみ）を表示
 - 音声ファイルのアップロードにも対応（mp3 / m4a / webm など）
 - 録音中のキャンセル（確認ダイアログあり）
+- **録音データの自動ローカル保存**: 録音停止時に音声ファイルを手元へ自動ダウンロード。
+  文字起こしやNotion保存が失敗しても録音そのものは失われない
+- **長時間音声の自動分割アップロード**: 4MBを超える音声は 16kHz / モノラルのWAVに変換し、
+  2分ごとに分割して順次文字起こし。結果を結合してから要約するため、1時間超の会議でも失敗しない
 - OpenAI Whisper による日本語文字起こし
 - GPT-4o による話者整理・要約・アクションアイテム抽出・キーワードタグ生成
 - 文字起こし・要約のワンクリックコピー
@@ -61,6 +65,11 @@ ALLOWED_EMAIL=your@gmail.com
 
 # Vercel本番環境のみ必要
 AUTH_URL=https://your-app.vercel.app
+
+# Vercel Blob（ストアをプロジェクトに接続後 `vercel env pull` で取得）
+BLOB_STORE_ID=store_xxxxxxxxxxxx
+VERCEL_OIDC_TOKEN=eyJxxxxxxxxxxxx
+BLOB_WEBHOOK_PUBLIC_KEY=MCowBQYDK2VwAyEAxxxxxxxxxxxx
 ```
 
 | 変数名 | 説明 |
@@ -73,6 +82,9 @@ AUTH_URL=https://your-app.vercel.app
 | `AUTH_SECRET` | NextAuth 署名用シークレット（`openssl rand -base64 32` で生成） |
 | `ALLOWED_EMAIL` | アクセスを許可するGoogleアカウントのメールアドレス |
 | `AUTH_URL` | Vercel 本番環境のURL（デプロイ時のみ必要） |
+| `BLOB_STORE_ID` | Vercel Blob ストアのID（OIDC認証に使用） |
+| `VERCEL_OIDC_TOKEN` | Vercel が発行する短命トークン。本番は自動注入、ローカルは `vercel env pull` |
+| `BLOB_WEBHOOK_PUBLIC_KEY` | presigned アップロードのコールバック検証用の公開鍵 |
 
 ### 4. Google OAuth の設定
 

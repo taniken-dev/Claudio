@@ -15,3 +15,5 @@ out/
 *.pem
 npm-debug.log*
 node_modules
+.vercel
+.env*

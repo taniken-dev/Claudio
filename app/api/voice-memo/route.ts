@@ -7,27 +7,14 @@ const notion = new NotionClient({ auth: process.env.NOTION_API_KEY });
 
 export async function POST(req: NextRequest) {
   try {
-    const formData = await req.formData();
-    const audioFile = formData.get("audio");
-
-    if (!audioFile || !(audioFile instanceof Blob)) {
-      return NextResponse.json({ error: "音声ファイルがありません。" }, { status: 400 });
-    }
-
-    // Step 1: OpenAI Whisper で文字起こし
-    const file = new File([audioFile], "recording.webm", { type: audioFile.type });
-    const transcription = await openai.audio.transcriptions.create({
-      file,
-      model: "whisper-1",
-      language: "ja",
-    });
-    const transcript = transcription.text.trim();
+    const body = await req.json();
+    const transcript = (body.transcript as string | undefined)?.trim() ?? "";
 
     if (!transcript) {
       return NextResponse.json({ error: "音声から文字を認識できませんでした。" }, { status: 422 });
     }
 
-    // Step 2: GPT-4o で要約・整理（失敗しても文字起こしは保存する）
+    // Step 1: GPT-4o で要約・整理（失敗しても文字起こしは保存する）
     let summary = "";
     let keywords: string[] = [];
     let summaryFailed = false;
@@ -97,7 +84,7 @@ ${transcript}`,
       summaryFailed = true;
     }
 
-    // Step 3: Notion に子ページとして保存
+    // Step 2: Notion に子ページとして保存
     const pageId = process.env.NOTION_PAGE_ID;
     let notionUrl: string | undefined;
 
@@ -106,7 +93,7 @@ ${transcript}`,
       const jstOffset = 9 * 60 * 60 * 1000;
       const jst = new Date(now.getTime() + jstOffset);
 
-      const userTitle = (formData.get("title") as string | null)?.trim() ?? "";
+      const userTitle = (body.title as string | undefined)?.trim() ?? "";
       const pad = (n: number) => String(n).padStart(2, "0");
       const dateTimeStr = `${jst.getUTCFullYear()}/${pad(jst.getUTCMonth() + 1)}/${pad(jst.getUTCDate())} ${pad(jst.getUTCHours())}:${pad(jst.getUTCMinutes())}`;
 

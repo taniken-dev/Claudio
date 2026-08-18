@@ -1,8 +1,13 @@
 "use client";
 
 import { useRef, useState, useEffect } from "react";
+import { uploadPresigned } from "@vercel/blob/client";
+import { prepareAudioForWhisper, saveBlobLocally, timestampedFilename } from "@/lib/audio";
 
 type Status = "idle" | "recording" | "processing" | "done" | "error";
+
+// Whisper（whisper-1）のファイル上限。約30kbpsの録音で約118分に相当する。
+const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
 
 interface Result {
   transcript: string;
@@ -24,6 +29,11 @@ export default function Home() {
   const [title, setTitle] = useState<string>("");
   const [elapsed, setElapsed] = useState(0);
   const [copied, setCopied] = useState<"transcript" | "summary" | null>(null);
+  const [progressLabel, setProgressLabel] = useState("処理中…");
+  const [savedFilename, setSavedFilename] = useState<string>("");
+  const [blobWarning, setBlobWarning] = useState<string>("");
+
+  const lastRecordingRef = useRef<{ blob: Blob; filename: string } | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -101,6 +111,7 @@ export default function Home() {
       setStatus("recording");
       setResult(null);
       setErrorMessage("");
+      setBlobWarning("");
     } catch {
       setErrorMessage("マイクへのアクセスが拒否されました。");
       setStatus("error");
@@ -129,7 +140,14 @@ export default function Home() {
         ?.getTracks()
         .forEach((t) => t.stop());
       cleanupAudio();
-      await processAudio(blob);
+
+      // 文字起こしが失敗しても録音そのものを失わないよう、先に手元へ保存する
+      const filename = timestampedFilename("webm");
+      lastRecordingRef.current = { blob, filename };
+      saveBlobLocally(blob, filename);
+      setSavedFilename(filename);
+
+      await processAudio(blob, filename);
     };
 
     recorder.stop();
@@ -164,8 +182,11 @@ export default function Home() {
     e.target.value = "";
     setResult(null);
     setErrorMessage("");
+    setSavedFilename("");
+    setBlobWarning("");
+    lastRecordingRef.current = null;
     setStatus("processing");
-    await processAudio(file);
+    await processAudio(file, file.name);
   };
 
   const copyToClipboard = async (text: string, key: "transcript" | "summary") => {
@@ -174,15 +195,93 @@ export default function Home() {
     setTimeout(() => setCopied(null), 2000);
   };
 
-  const processAudio = async (audioBlob: Blob) => {
+  // 長さに関わらず必ずクラウドへ退避する。長い録音ほど失うと痛いので、
+  // 分割経路に回る大きさでもバックアップだけは先に取っておく。
+  // 失敗しても文字起こしは続行する（ローカル保存は済んでいる）。
+  const backupToBlob = async (audioBlob: Blob, sourceName: string) => {
     try {
-      const formData = new FormData();
-      formData.append("audio", audioBlob, "recording.webm");
-      formData.append("title", title);
+      setProgressLabel("録音をアップロード中…");
+      const uploaded = await uploadPresigned(sourceName, audioBlob, {
+        access: "private",
+        contentType: audioBlob.type || "audio/webm",
+        handleUploadUrl: "/api/blob-upload",
+      });
+      return uploaded.url;
+    } catch (err) {
+      console.error("Blobへの保存に失敗:", err);
+      setBlobWarning(
+        err instanceof Error ? err.message : "クラウドへの保存に失敗しました。"
+      );
+      return null;
+    }
+  };
 
+  // 25MB（約106分）以下なら、Blobに置いたまま1回で文字起こしする。
+  // 分割もWAV再エンコードもしないので、境界の欠落もメモリ肥大も起きない。
+  const transcribeFromBlob = async (blobUrl: string, sourceName: string) => {
+    setProgressLabel("文字起こし中…");
+    const res = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ blobUrl, filename: sourceName }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
+    }
+
+    const data: { text: string } = await res.json();
+    return data.text.trim();
+  };
+
+  // 25MB超のときだけ使う退避経路。16kHz WAVに変換して2分ずつ送る。
+  const transcribeBySplitting = async (audioBlob: Blob, sourceName: string) => {
+    setProgressLabel("音声を準備中…");
+    const prepared = await prepareAudioForWhisper(audioBlob, sourceName);
+
+    const texts: string[] = [];
+    for (let i = 0; i < prepared.total; i++) {
+      setProgressLabel(
+        prepared.total > 1
+          ? `文字起こし中… (${i + 1}/${prepared.total})`
+          : "文字起こし中…"
+      );
+
+      // ここで初めてWAV化する。ループを抜ければ参照が切れて回収される。
+      const part = prepared.get(i);
+      const formData = new FormData();
+      formData.append("audio", part.blob, part.filename);
+      formData.append("filename", part.filename);
+
+      const res = await fetch("/api/transcribe", { method: "POST", body: formData });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
+      }
+
+      const data: { text: string } = await res.json();
+      texts.push(data.text);
+    }
+
+    return texts.filter((t) => t).join("\n").trim();
+  };
+
+  const processAudio = async (audioBlob: Blob, sourceName: string) => {
+    try {
+      const blobUrl = await backupToBlob(audioBlob, sourceName);
+
+      // Blobに置けた25MB以下の録音だけが単一呼び出しで通る。
+      // 25MB超、またはアップロードに失敗した場合は分割経路で処理する。
+      const transcript =
+        blobUrl && audioBlob.size <= WHISPER_MAX_BYTES
+          ? await transcribeFromBlob(blobUrl, sourceName)
+          : await transcribeBySplitting(audioBlob, sourceName);
+
+      setProgressLabel("要約してNotionに保存中…");
       const res = await fetch("/api/voice-memo", {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript, title }),
       });
 
       if (!res.ok) {
@@ -251,7 +350,7 @@ export default function Home() {
         {isProcessing && (
           <div style={styles.processing}>
             <span style={styles.spinner} />
-            処理中…
+            {progressLabel}
           </div>
         )}
       </div>
@@ -271,9 +370,37 @@ export default function Home() {
         </p>
       )}
 
+      {blobWarning && (
+        <p style={styles.blobWarning}>
+          ⚠️ クラウド保存に失敗しました（{blobWarning}）。録音は手元のファイルに残っています。
+        </p>
+      )}
+
+      {savedFilename && (
+        <p style={styles.savedNote}>
+          💾 録音ファイルを <code>{savedFilename}</code> として保存しました。
+        </p>
+      )}
+
       {status === "error" && (
         <div style={styles.errorBox}>
           <strong>エラー:</strong> {errorMessage}
+          {lastRecordingRef.current && (
+            <div style={{ marginTop: 12 }}>
+              <p style={{ margin: "0 0 8px", fontSize: 13 }}>
+                録音データは残っています。保存し直してから、あとで「ファイルを選択」でやり直せます。
+              </p>
+              <button
+                onClick={() =>
+                  lastRecordingRef.current &&
+                  saveBlobLocally(lastRecordingRef.current.blob, lastRecordingRef.current.filename)
+                }
+                style={styles.copyBtn}
+              >
+                録音ファイルを保存
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -503,5 +630,24 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#888",
     margin: "8px 0 0",
     lineHeight: 1.6,
+  },
+  blobWarning: {
+    fontSize: 13,
+    color: "#975a16",
+    background: "#fffff0",
+    border: "1px solid #faf089",
+    borderRadius: 8,
+    padding: "10px 14px",
+    margin: "12px 0 0",
+    lineHeight: 1.6,
+  },
+  savedNote: {
+    fontSize: 13,
+    color: "#2f855a",
+    background: "#f0fff4",
+    border: "1px solid #c6f6d5",
+    borderRadius: 8,
+    padding: "10px 14px",
+    margin: "12px 0 0",
   },
 };
