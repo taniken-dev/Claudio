@@ -18,17 +18,21 @@ export default async function RootLayout({
     <html lang="ja">
       <body>
         {session && (
-          <header style={headerStyle}>
-            <span style={emailStyle}>{session.user?.email}</span>
+          <header className="nav" style={{ maxWidth: 760, margin: "0 auto", padding: "28px 28px 0" }}>
+            <span className="nav-brand">
+              <span style={{ width: 34, height: 34, borderRadius: "50%", background: "var(--color-accent)", color: "var(--color-bg)", display: "flex", alignItems: "center", justifyContent: "center", flex: "none" }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.75" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+              </span>
+              Claudio
+            </span>
+            <span className="tag tag-neutral">{session.user?.email}</span>
             <form
               action={async () => {
                 "use server";
                 await signOut({ redirectTo: "/login" });
               }}
             >
-              <button type="submit" style={signOutStyle}>
-                ログアウト
-              </button>
+              <button type="submit" className="btn btn-ghost">ログアウト</button>
             </form>
           </header>
         )}
@@ -37,27 +41,3 @@ export default async function RootLayout({
     </html>
   );
 }
-
-const headerStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "flex-end",
-  gap: 16,
-  padding: "10px 24px",
-  borderBottom: "1px solid #e2e8f0",
-  background: "#fff",
-};
-
-const emailStyle: React.CSSProperties = {
-  fontSize: 13,
-  color: "#666",
-};
-
-const signOutStyle: React.CSSProperties = {
-  fontSize: 13,
-  color: "#e53e3e",
-  background: "none",
-  border: "none",
-  cursor: "pointer",
-  padding: 0,
-};
