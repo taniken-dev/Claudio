@@ -13,7 +13,10 @@ import { auth } from "@/auth";
 const MAX_RECORDING_BYTES = 200 * 1024 * 1024;
 // MediaRecorder は "audio/webm;codecs=opus" のようにコーデック付きで返すため、
 // 個別列挙だと一致しない。ブラウザ差異も吸収できるワイルドカードを使う。
-const ALLOWED_CONTENT_TYPES = ["audio/*"];
+// MediaRecorder は "audio/webm;codecs=opus" を返すが、保存済みファイルを
+// 選び直すと OS/ブラウザが同じ .webm を "video/webm" と報告することがある。
+// webm/mp4/ogg は音声専用でもコンテナ上は video/* になり得るため許可する。
+const ALLOWED_CONTENT_TYPES = ["audio/*", "video/webm", "video/mp4", "video/ogg"];
 
 export async function POST(request: Request): Promise<NextResponse> {
   const body = (await request.json()) as HandleUploadPresignedBody;

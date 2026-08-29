@@ -69,8 +69,23 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ text: await transcribe(file) });
   } catch (err) {
-    console.error("文字起こしエラー:", err);
+    // "Connection error." だけでは原因が分からないので、下位層の理由まで残す。
+    // undici の cause に ECONNRESET / ENOTFOUND / UND_ERR_CONNECT_TIMEOUT
+    // などが入っており、ネットワークかAPI側かの切り分けに要る。
+    const e = err as { name?: string; status?: number; cause?: unknown };
+    const cause = e.cause as { code?: string; message?: string } | undefined;
+    console.error("文字起こしエラー:", {
+      name: e.name,
+      status: e.status,
+      message: err instanceof Error ? err.message : String(err),
+      causeCode: cause?.code,
+      causeMessage: cause?.message,
+    });
+
     const message = err instanceof Error ? err.message : "サーバーエラー";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json(
+      { error: cause?.code ? `${message}（${cause.code}）` : message },
+      { status: 500 }
+    );
   }
 }
