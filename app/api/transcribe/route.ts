@@ -2,7 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import { get } from "@vercel/blob";
 import OpenAI from "openai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// fetch を明示的に渡さないと SDK は node-fetch を使う。Vercel 上では
+// 音声アップロード中に read ECONNRESET で切断される事象が出たため、
+// Node 標準の fetch（undici）に寄せる。
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  fetch: globalThis.fetch,
+  maxRetries: 3,
+  // maxDuration(300秒)より手前で諦め、原因の分かるエラーを返せるようにする
+  timeout: 240_000,
+});
 
 // Fluid compute 有効時は Hobby でも 300 秒が上限かつ既定値。
 // 実測 6.7 分の音声で約 9.6 秒だったため、1時間でも 90 秒前後で収まる想定。
@@ -12,11 +21,17 @@ export const maxDuration = 300;
 const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
 
 async function transcribe(file: File): Promise<string> {
+  // 失敗したときにサイズと所要時間の相関を追えるようにしておく
+  const startedAt = Date.now();
+  console.log("[transcribe] 送信:", file.name, file.type, `${file.size}バイト`);
+
   const transcription = await openai.audio.transcriptions.create({
     file,
     model: "whisper-1",
     language: "ja",
   });
+
+  console.log("[transcribe] 完了:", `${Date.now() - startedAt}ms`);
   return transcription.text.trim();
 }
 

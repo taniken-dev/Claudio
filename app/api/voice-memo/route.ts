@@ -2,7 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { Client as NotionClient } from "@notionhq/client";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// 文字起こし側と同じ理由で node-fetch を避け、Node 標準の fetch を使う
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  fetch: globalThis.fetch,
+  maxRetries: 3,
+});
 const notion = new NotionClient({ auth: process.env.NOTION_API_KEY });
 
 export async function POST(req: NextRequest) {
