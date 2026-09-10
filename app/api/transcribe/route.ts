@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { get } from "@vercel/blob";
 import OpenAI from "openai";
+import { fetchWithDuplex } from "@/lib/openai-fetch";
 
 // fetch を明示的に渡さないと SDK は node-fetch を使う。Vercel 上では
 // 音声アップロード中に read ECONNRESET で切断される事象が出たため、
 // Node 標準の fetch（undici）に寄せる。
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  fetch: globalThis.fetch,
+  fetch: fetchWithDuplex,
   maxRetries: 3,
   // maxDuration(300秒)より手前で諦め、原因の分かるエラーを返せるようにする
   timeout: 240_000,
