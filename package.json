@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@notionhq/client": "^2.2.15",
     "@vercel/blob": "^2.8.0",
     "next": "^15.3.3",

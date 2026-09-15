@@ -5,6 +5,11 @@ const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 // 16kHz / mono / 16bit = 32KB/s。120秒で約3.84MBとなり上限に収まる。
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_SECONDS = 120;
+// MP3 は手元での保管・共有用。文字起こしには元の webm を使う（同程度の音質だと MP3 は倍近いサイズになり、
+// Whisper の 25MB 上限を超えやすいため）。16kHz / mono / 48kbps で1時間あたり約21.6MB。
+const MP3_KBPS = 48;
+// この単位でメインスレッドに処理を譲り、変換中も画面が固まらないようにする。
+const MP3_SLICE_SAMPLES = TARGET_SAMPLE_RATE * 10;
 
 export interface AudioPart {
   blob: Blob;
@@ -65,6 +70,32 @@ export function prepareFromSamples(samples: Float32Array): PreparedAudio {
   };
 }
 
+export async function convertToMp3(blob: Blob, onProgress?: (ratio: number) => void): Promise<Blob> {
+  const { Mp3Encoder } = await import("@breezystack/lamejs");
+  const samples = await decodeToMono(blob);
+  const encoder = new Mp3Encoder(1, TARGET_SAMPLE_RATE, MP3_KBPS);
+  const parts: Uint8Array<ArrayBuffer>[] = [];
+  const pcm = new Int16Array(MP3_SLICE_SAMPLES);
+
+  for (let offset = 0; offset < samples.length; offset += MP3_SLICE_SAMPLES) {
+    const slice = samples.subarray(offset, Math.min(offset + MP3_SLICE_SAMPLES, samples.length));
+    const chunk = pcm.subarray(0, slice.length);
+    for (let i = 0; i < slice.length; i++) chunk[i] = toInt16(slice[i]);
+    // エンコーダが内部バッファを使い回しても壊れないよう、取り出した分はコピーして保持する。
+    parts.push(encoder.encodeBuffer(chunk).slice());
+    onProgress?.(Math.min(1, (offset + slice.length) / samples.length));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  parts.push(encoder.flush().slice());
+
+  return new Blob(parts, { type: "audio/mpeg" });
+}
+
+function toInt16(sample: number): number {
+  const clamped = Math.max(-1, Math.min(1, sample));
+  return clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+}
+
 async function decodeToMono(blob: Blob): Promise<Float32Array> {
   const arrayBuffer = await blob.arrayBuffer();
   const ctx = new OfflineAudioContext(1, 1, TARGET_SAMPLE_RATE);
@@ -113,8 +144,7 @@ function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   view.setUint32(40, samples.length * 2, true);
 
   for (let i = 0; i < samples.length; i++) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(44 + i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    view.setInt16(44 + i * 2, toInt16(samples[i]), true);
   }
 
   return new Blob([bytes], { type: "audio/wav" });

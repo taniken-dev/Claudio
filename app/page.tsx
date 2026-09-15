@@ -2,7 +2,7 @@
 
 import { useRef, useState, useEffect } from "react";
 import { uploadPresigned } from "@vercel/blob/client";
-import { prepareAudioForWhisper, saveBlobLocally, timestampedFilename } from "@/lib/audio";
+import { convertToMp3, prepareAudioForWhisper, saveBlobLocally, timestampedFilename } from "@/lib/audio";
 
 type Status = "idle" | "recording" | "processing" | "done" | "error";
 
@@ -32,6 +32,7 @@ export default function Home() {
   const [progressLabel, setProgressLabel] = useState("処理中…");
   const [savedFilename, setSavedFilename] = useState<string>("");
   const [blobWarning, setBlobWarning] = useState<string>("");
+  const [mp3Notice, setMp3Notice] = useState<string>("");
 
   const lastRecordingRef = useRef<{ blob: Blob; filename: string } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -116,6 +117,7 @@ export default function Home() {
       setResult(null);
       setErrorMessage("");
       setBlobWarning("");
+      setMp3Notice("");
     } catch (err) {
       cleanupAudio();
       setErrorMessage(err instanceof Error ? err.message : "録音を開始できませんでした。");
@@ -144,6 +146,9 @@ export default function Home() {
       saveBlobLocally(blob, filename);
       setSavedFilename(filename);
       await processAudio(blob, filename);
+      // 変換はデコードで数百MBのメモリを使う。文字起こしと同時に走らせてタブが落ちないよう、
+      // Notion 保存まで終わってから行う（webm は上で保存済みなので、変換に失敗しても録音は残る）。
+      await saveAsMp3(blob, filename);
     };
     recorder.stop();
     setStatus("processing");
@@ -167,6 +172,7 @@ export default function Home() {
     setErrorMessage("");
     setSavedFilename("");
     setBlobWarning("");
+    setMp3Notice("");
     lastRecordingRef.current = null;
     setStatus("processing");
     await processAudio(file, file.name);
@@ -176,6 +182,19 @@ export default function Home() {
     await navigator.clipboard.writeText(text);
     setCopied(key);
     setTimeout(() => setCopied(null), 2000);
+  };
+
+  const saveAsMp3 = async (audioBlob: Blob, webmName: string) => {
+    const mp3Name = webmName.replace(/\.webm$/, ".mp3");
+    try {
+      setMp3Notice("🎵 MP3に変換中…");
+      const mp3 = await convertToMp3(audioBlob, (ratio) => setMp3Notice(`🎵 MP3に変換中… ${Math.round(ratio * 100)}%`));
+      saveBlobLocally(mp3, mp3Name);
+      setMp3Notice(`💾 MP3を ${mp3Name} として保存しました`);
+    } catch (err) {
+      console.error("MP3への変換に失敗:", err);
+      setMp3Notice(`⚠️ MP3への変換に失敗しました。録音は ${webmName} として保存済みです。`);
+    }
   };
 
   const backupToBlob = async (audioBlob: Blob, sourceName: string) => {
@@ -353,6 +372,10 @@ export default function Home() {
 
       {savedFilename && (
         <p className="tag tag-accent-2" style={{ marginTop: 16 }}>💾 録音ファイルを {savedFilename} として保存しました</p>
+      )}
+
+      {mp3Notice && (
+        <p className="tag tag-accent-2" style={{ marginTop: 8 }}>{mp3Notice}</p>
       )}
 
       {status === "error" && (
