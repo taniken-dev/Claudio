@@ -1,6 +1,13 @@
-import { signIn } from "@/auth";
+import { redirect } from "next/navigation";
+import { auth, signIn } from "@/auth";
 
-export default function LoginPage() {
+export default async function LoginPage() {
+  // ミドルウェアは未ログインでも入れるよう /login を素通りさせている。ログイン済みで開いた場合
+  // （タブの復元や履歴から開いたときなど）はここでアプリへ戻さないと、ヘッダーはログイン済みなのに
+  // 本文はログイン画面という食い違った表示になる。
+  const session = await auth();
+  if (session) redirect("/");
+
   return (
     <main style={styles.main}>
       <h1 style={styles.title}>Claudio</h1>
