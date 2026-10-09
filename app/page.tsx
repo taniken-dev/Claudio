@@ -3,18 +3,12 @@
 import { useRef, useState, useEffect } from "react";
 import { uploadPresigned } from "@vercel/blob/client";
 import { convertToMp3, prepareAudioForWhisper, saveBlobLocally, timestampedFilename } from "@/lib/audio";
-import { VIDEO_CONSTRAINTS, pickVideoFormat, videoRecorderOptions } from "@/lib/video";
+import { beginRecording, type Recording, type RecordedVideo, type Sources } from "@/lib/recorder";
 
 type Status = "idle" | "recording" | "processing" | "done" | "error";
 
 const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
 const SOURCE_PREF_KEY = "claudio.audioSources";
-
-interface Sources {
-  mic: boolean;
-  system: boolean;
-  screen: boolean;
-}
 
 interface Result {
   transcript: string;
@@ -57,19 +51,11 @@ export default function Home() {
   // 音声と動画を続けて保存するとブラウザが2つ目のダウンロードを止めることがあるため、
   // 取りこぼしたときに押し直せるよう録画を保持しておく（次の録音開始で解放する）。
   const lastVideoRef = useRef<{ blob: Blob; filename: string } | null>(null);
-  const audioRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const videoRecorderRef = useRef<MediaRecorder | null>(null);
-  const videoChunksRef = useRef<Blob[]>([]);
-  const videoExtensionRef = useRef<"mp4" | "webm">("mp4");
-  const videoErroredRef = useRef(false);
+  const recordingRef = useRef<Recording | null>(null);
   // 共有停止や音声の途切れなど、ボタン以外のきっかけで録音を畳むため、関数の最新版を保持する
   const stopRecordingRef = useRef<(reason?: string) => void>(() => {});
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const displayStreamRef = useRef<MediaStream | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
 
   const [sources, setSources] = useState<Sources>({ mic: true, system: true, screen: false });
   // チェックボックスは希望であって保証ではない（共有ダイアログで音声を切られることがある）。
@@ -121,154 +107,26 @@ export default function Home() {
     };
   }, [status]);
 
-  /**
-   * 文字起こし用の音声と、画面録画用の映像+音声を組み立てる。
-   * PC内部音声と画面録画はどちらも getDisplayMedia 由来なので、共有ダイアログが
-   * 二度出ないよう1回の呼び出しでまかない、取れたトラックを用途別に振り分ける。
-   */
-  const buildStreams = async (): Promise<{ audio: MediaStream; video: MediaStream | null }> => {
-    let videoTrack: MediaStreamTrack | null = null;
-
-    // getDisplayMedia は「ユーザー操作の直後」でないとブラウザに弾かれ、この操作は数秒で失効する。
-    // マイク許可のダイアログで迷われると間に合わなくなるため、操作を必要としない
-    // getUserMedia より先に必ずこちらを呼ぶ。
-    if (sources.system || sources.screen) {
-      let displayStream: MediaStream;
-      try {
-        // 音声だけを要求する指定はできないので、内部音声のみのときも映像を取って後で捨てる。
-        displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: sources.screen ? VIDEO_CONSTRAINTS : true,
-          audio: sources.system,
-        });
-      } catch {
-        throw new Error("画面の共有がキャンセルされました。PC内部音声や画面録画には共有の許可が必要です。");
-      }
-      // 失敗して抜ける場合もトラックを止められるよう、検査より先に控えておく
-      displayStreamRef.current = displayStream;
-
-      const track = displayStream.getVideoTracks()[0] ?? null;
-      if (sources.screen && track) {
-        // 要求時の指定を無視して共有元の解像度で返すブラウザがあるため、取得後にも掛け直す
-        try {
-          await track.applyConstraints(VIDEO_CONSTRAINTS);
-        } catch {}
-        videoTrack = track;
-      } else {
-        track?.stop();
-      }
-
-      if (sources.system && displayStream.getAudioTracks().length === 0) {
-        throw new Error("音声が共有されていません。共有ダイアログで「タブの音声を共有」を有効にしてください。");
-      }
-    }
-
-    if (sources.mic) {
-      try {
-        micStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {
-        throw new Error("マイクへのアクセスが拒否されました。");
-      }
-    }
-
-    const systemAudio = displayStreamRef.current?.getAudioTracks().length ? displayStreamRef.current : null;
-    const audioStreams = [micStreamRef.current, systemAudio].filter((s): s is MediaStream => s !== null);
-    if (audioStreams.length === 0) {
-      throw new Error("録音する音声がありません。マイクかPC内部音声のどちらかを選んでください。");
-    }
-
-    setActiveSources({
-      mic: micStreamRef.current !== null,
-      system: systemAudio !== null,
-      screen: videoTrack !== null,
-    });
-
-    // 音声を混ぜている場合、マイクが途切れても録音は止まらず無音のまま続く。
-    // Bluetooth マイクの電池切れなどに気づけるよう知らせる（自分で stop() した場合は発火しない）。
-    micStreamRef.current?.getAudioTracks()[0]?.addEventListener(
-      "ended",
-      () => setRecordingWarning("🎤 マイクの入力が途切れました。録音は続いていますが、マイクの音は入っていません。"),
-      { once: true },
-    );
-
-    // 音源が1つで画面録画もしないなら、余計な処理を挟まず元のストリームをそのまま使う
-    if (audioStreams.length === 1 && !videoTrack) {
-      return { audio: audioStreams[0], video: null };
-    }
-
-    const ctx = new AudioContext();
-    audioContextRef.current = ctx;
-    const inputs = audioStreams.map((stream) => ctx.createMediaStreamSource(stream));
-    const mixInto = () => {
-      const dest = ctx.createMediaStreamDestination();
-      inputs.forEach((node) => node.connect(dest));
-      return dest.stream;
-    };
-
-    return {
-      audio: mixInto(),
-      // 1本の音声トラックを2つの MediaRecorder で共有するとブラウザによっては録れないため、
-      // 動画側には同じミックスの別の出力先を渡す。
-      video: videoTrack ? new MediaStream([videoTrack, ...mixInto().getAudioTracks()]) : null,
-    };
-  };
-
   const startRecording = async () => {
     if (!hasAudioSource) return;
     // ここから getDisplayMedia までの間に await を挟むと、クリックの操作扱いが失効して弾かれる
     setShowSourceDialog(false);
+    setRecordingWarning("");
     try {
-      const streams = await buildStreams();
-
-      const audioMimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      const audioRecorder = new MediaRecorder(streams.audio, { mimeType: audioMimeType, audioBitsPerSecond: 32000 });
-      chunksRef.current = [];
-      audioRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-
-      videoRecorderRef.current = null;
-      videoChunksRef.current = [];
+      const recording = await beginRecording(sources, {
+        onWarning: setRecordingWarning,
+        onAutoStop: (reason) => stopRecordingRef.current(reason),
+      });
+      recordingRef.current = recording;
       lastVideoRef.current = null;
-      if (streams.video) {
-        const format = pickVideoFormat();
-        videoExtensionRef.current = format.extension;
-        const videoRecorder = new MediaRecorder(streams.video, videoRecorderOptions(format));
-        videoRecorder.ondataavailable = (e) => { if (e.data.size > 0) videoChunksRef.current.push(e.data); };
-        videoErroredRef.current = false;
-        // エラーが起きると録画はそこで止まるが、それまでのデータは残るので捨てずに停止時に保存する
-        videoRecorder.addEventListener("error", (e) => {
-          console.error("画面録画のエラー:", e);
-          videoErroredRef.current = true;
-          setRecordingWarning("⚠️ 画面録画が止まりました。止まるまでの録画は停止時に保存します（音声の録音は続いています）。");
-        }, { once: true });
-        // 1時間で数百MBになるため、音声より粗い間隔で受け取って配列の要素数を抑える
-        videoRecorder.start(1000);
-        videoRecorderRef.current = videoRecorder;
-
-        // ブラウザの「共有を停止」バーで止められたら、録れたところまでで正常に畳む
-        streams.video.getVideoTracks()[0]?.addEventListener(
-          "ended",
-          () => stopRecordingRef.current("画面共有が停止されたため、録画を終了しました。"),
-          { once: true },
-        );
-      }
-
-      // 生のストリームを録っている場合、トラックが切れるとブラウザが録音を勝手に止める。
-      // 停止処理をボタンにしか紐づけていないと、録音中の表示のまま固まりデータも保存されない。
-      audioRecorder.addEventListener(
-        "stop",
-        () => stopRecordingRef.current("音声の入力が途切れたため、録音を終了しました。"),
-        { once: true },
-      );
-      audioRecorder.start(100);
-      audioRecorderRef.current = audioRecorder;
+      setActiveSources(recording.activeSources);
       setElapsed(0);
       setVideoBytes(0);
       timerRef.current = setInterval(() => {
         setElapsed((s) => s + 1);
         // 画面録画は1時間で数百MBに達する。タブのメモリに載り続けるので、
         // 手遅れになる前に気づけるよう現在のサイズを出しておく。
-        if (videoRecorderRef.current) {
-          setVideoBytes(videoChunksRef.current.reduce((total, chunk) => total + chunk.size, 0));
-        }
+        if (recording.activeSources.screen) setVideoBytes(recording.videoBytes());
       }, 1000);
       setStatus("recording");
       setResult(null);
@@ -277,103 +135,64 @@ export default function Home() {
       setMp3Notice("");
       setVideoNotice("");
       setSavedFilename("");
-      setRecordingWarning("");
       setStopNotice("");
     } catch (err) {
-      cleanupAudio();
       setErrorMessage(err instanceof Error ? err.message : "録音を開始できませんでした。");
       setStatus("error");
     }
   };
 
-  const cleanupAudio = () => {
-    audioContextRef.current?.close();
-    audioContextRef.current = null;
-    displayStreamRef.current?.getTracks().forEach((t) => t.stop());
-    displayStreamRef.current = null;
-    micStreamRef.current?.getTracks().forEach((t) => t.stop());
-    micStreamRef.current = null;
-  };
-
   const stopRecording = (reason?: string) => {
-    // ボタンで止めた後にも録音の stop イベントからここへ来るので、2回目は何もしない
-    const audioRecorder = audioRecorderRef.current;
-    if (!audioRecorder) return;
-    audioRecorderRef.current = null;
+    // ボタンで止めた直後に共有停止などが重なっても、2回目は何もしない
+    const recording = recordingRef.current;
+    if (!recording) return;
+    recordingRef.current = null;
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (reason) setStopNotice(reason);
-
-    const videoRecorder = videoRecorderRef.current;
-    videoRecorderRef.current = null;
-    // MP4 は最後のデータが欠けるとほぼ再生できなくなる（実測: 6秒の録画が0.2秒分しか再生できなかった）。
-    // 時間で見切りをつけると録画を壊すので、必ず stop イベントを待つ。エラーで止まった場合も
-    // stop イベントは届き、既に止まっているならそのまま組み立てる。
-    const videoBlob = videoRecorder
-      ? new Promise<Blob>((resolve) => {
-          const assemble = () => resolve(new Blob(videoChunksRef.current, { type: videoRecorder.mimeType }));
-          if (videoRecorder.state === "inactive") {
-            assemble();
-            return;
-          }
-          videoRecorder.addEventListener("stop", assemble, { once: true });
-          videoRecorder.stop();
-        })
-      : null;
-
-    const finalize = async () => {
-      const blob = new Blob(chunksRef.current, { type: audioRecorder.mimeType });
-      const filename = timestampedFilename("webm");
-      lastRecordingRef.current = { blob, filename };
-
-      // ネットワークを使う処理より先に、録れたものを手元へ落とす。
-      // 文字起こしや Notion 保存が失敗しても記録そのものは失われない。
-      let hasVideo = false;
-      if (videoBlob) {
-        try {
-          const video = await videoBlob;
-          if (video.size === 0) throw new Error("画面録画のデータが空です。");
-          const videoFilename = timestampedFilename(videoExtensionRef.current);
-          lastVideoRef.current = { blob: video, filename: videoFilename };
-          saveBlobLocally(video, videoFilename);
-          setVideoNotice(
-            videoErroredRef.current
-              ? `🎬 画面録画を ${videoFilename} として保存しました（${formatSize(video.size)}）。途中で止まったため、止まった時点までの録画です。`
-              : `🎬 画面録画を ${videoFilename} として保存しました（${formatSize(video.size)}）`,
-          );
-          hasVideo = true;
-        } catch (err) {
-          console.error("画面録画の保存に失敗:", err);
-          setVideoNotice("⚠️ 画面録画の保存に失敗しました。音声は別に保存します。");
-        } finally {
-          videoChunksRef.current = [];
-        }
-      }
-
-      // 2つのファイルを続けて落とすとブラウザが「複数ファイルのダウンロード」を警告し、
-      // 2つ目が黙って止まることがある。録画を保存できたときは同じ音声がより高いビットレートで
-      // 動画に入っているので、webm は自動では落とさず手動ボタンから取り出せるようにする。
-      if (!hasVideo) {
-        saveBlobLocally(blob, filename);
-        setSavedFilename(filename);
-      }
-
-      cleanupAudio();
-      await processAudio(blob, filename);
-      // 変換はデコードで数百MBのメモリを使う。文字起こしと同時に走らせてタブが落ちないよう、
-      // Notion 保存まで終わってから行う（webm は上で保存済みなので、変換に失敗しても録音は残る）。
-      // 画面録画がある場合は同じ音声が動画に入っているので、メモリを使ってまで作らない。
-      if (!hasVideo) await saveAsMp3(blob, filename);
-    };
-
-    // 音声が途切れてブラウザに止められた場合は、既に止まっていて stop イベントはもう来ない
-    if (audioRecorder.state === "inactive") {
-      void finalize();
-    } else {
-      audioRecorder.addEventListener("stop", () => void finalize(), { once: true });
-      audioRecorder.stop();
-    }
     setRecordingWarning("");
     setStatus("processing");
+    void finalizeRecording(recording);
+  };
+
+  const finalizeRecording = async (recording: Recording) => {
+    const { audio: blob, video } = await recording.stop();
+    const filename = timestampedFilename("webm");
+    lastRecordingRef.current = { blob, filename };
+
+    // ネットワークを使う処理より先に、録れたものを手元へ落とす。
+    // 文字起こしや Notion 保存が失敗しても記録そのものは失われない。
+    const hasVideo = video ? saveVideo(video) : false;
+
+    // 2つのファイルを続けて落とすとブラウザが「複数ファイルのダウンロード」を警告し、
+    // 2つ目が黙って止まることがある。録画を保存できたときは同じ音声がより高いビットレートで
+    // 動画に入っているので、webm は自動では落とさず手動ボタンから取り出せるようにする。
+    if (!hasVideo) {
+      saveBlobLocally(blob, filename);
+      setSavedFilename(filename);
+    }
+
+    await processAudio(blob, filename);
+    // 変換はデコードで数百MBのメモリを使う。文字起こしと同時に走らせてタブが落ちないよう、
+    // Notion 保存まで終わってから行う（webm は上で保存済みなので、変換に失敗しても録音は残る）。
+    // 画面録画がある場合は同じ音声が動画に入っているので、メモリを使ってまで作らない。
+    if (!hasVideo) await saveAsMp3(blob, filename);
+  };
+
+  const saveVideo = (video: RecordedVideo): boolean => {
+    if (video.blob.size === 0) {
+      console.error("画面録画の保存に失敗: 画面録画のデータが空です。");
+      setVideoNotice("⚠️ 画面録画の保存に失敗しました。音声は別に保存します。");
+      return false;
+    }
+    const videoFilename = timestampedFilename(video.extension);
+    lastVideoRef.current = { blob: video.blob, filename: videoFilename };
+    saveBlobLocally(video.blob, videoFilename);
+    setVideoNotice(
+      video.errored
+        ? `🎬 画面録画を ${videoFilename} として保存しました（${formatSize(video.blob.size)}）。途中で止まったため、止まった時点までの録画です。`
+        : `🎬 画面録画を ${videoFilename} として保存しました（${formatSize(video.blob.size)}）`,
+    );
+    return true;
   };
 
   // ボタン以外のきっかけ（共有停止・音声の途切れ）から呼べるよう、最新の stopRecording を保持する
@@ -381,16 +200,9 @@ export default function Home() {
 
   const cancelRecording = () => {
     if (!window.confirm("録音を破棄しますか？")) return;
-    const audioRecorder = audioRecorderRef.current;
-    const videoRecorder = videoRecorderRef.current;
-    audioRecorderRef.current = null;
-    videoRecorderRef.current = null;
+    recordingRef.current?.cancel();
+    recordingRef.current = null;
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    if (videoRecorder) { videoRecorder.onstop = null; videoRecorder.stop(); }
-    if (audioRecorder) { audioRecorder.onstop = () => cleanupAudio(); audioRecorder.stop(); }
-    else cleanupAudio();
-    chunksRef.current = [];
-    videoChunksRef.current = [];
     setRecordingWarning("");
     setStatus("idle");
     setElapsed(0);

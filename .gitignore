@@ -22,3 +22,7 @@ node_modules
 
 # TypeScript のビルドキャッシュ（ビルドのたびに差分が出るため追跡しない）
 tsconfig.tsbuildinfo
+
+# テストの生成物
+/test-results/
+/playwright-report/

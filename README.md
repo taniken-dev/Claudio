@@ -156,3 +156,16 @@ npm run dev
 ## 環境変数
 
 APIキーはすべてサーバーサイド（Next.js Route Handler）でのみ使用されます。ブラウザには一切露出しません。
+
+## テスト
+
+```bash
+npm test              # 単体テスト（Vitest）: 音声の分割・WAV変換、録画形式の選択
+npm run test:browser  # ブラウザテスト（Playwright）: 本物の Chrome で録音・録画を動かす
+```
+
+- アプリ本体は Google ログインが必要で自動テストできないため、録音の制御は `lib/recorder.ts` に切り出し、
+  `tests/browser/harness/` のテスト用ページに載せて動かしている
+- マイクは Chrome の偽デバイス（ビープ音）、画面共有は canvas の映像と発振音で代用する
+- ブラウザテストはインストール済みの Google Chrome を使う（Playwright 同梱の Chromium は MP4 を録れないため）
+- 録音中に固まる、MP4 が最後まで再生できない、静止画面で録画が溜め込まれる、といった過去のバグの再発防止を含む
