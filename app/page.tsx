@@ -14,9 +14,9 @@ const SOURCE_PREF_KEY = "claudio.audioSources";
 
 interface Result {
   transcript: string;
-  summary: string;
   notionUrl?: string;
-  summaryFailed?: boolean;
+  /** Notion への保存に失敗した理由。文字起こし自体は画面に出してコピーできるようにする */
+  notionError?: string;
 }
 
 function formatSize(bytes: number): string {
@@ -36,7 +36,7 @@ export default function Home() {
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [title, setTitle] = useState<string>("");
   const [elapsed, setElapsed] = useState(0);
-  const [copied, setCopied] = useState<"transcript" | "summary" | null>(null);
+  const [copied, setCopied] = useState(false);
   const [progressLabel, setProgressLabel] = useState("処理中…");
   const [savedFilename, setSavedFilename] = useState<string>("");
   const [blobWarning, setBlobWarning] = useState<string>("");
@@ -225,10 +225,10 @@ export default function Home() {
     await processAudio(file, file.name);
   };
 
-  const copyToClipboard = async (text: string, key: "transcript" | "summary") => {
+  const copyToClipboard = async (text: string) => {
     await navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(null), 2000);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   const saveAsMp3 = async (audioBlob: Blob, webmName: string) => {
@@ -339,22 +339,29 @@ export default function Home() {
           ? await transcribeFromBlob(blobUrl, sourceName)
           : await transcribeBySplitting(audioBlob, sourceName);
 
-      setProgressLabel("要約してNotionに保存中…");
+      setResult({ transcript, ...(await saveToNotion(transcript)) });
+      setStatus("done");
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : "不明なエラー");
+      setStatus("error");
+    }
+  };
+
+  // 文字起こしはお金と時間をかけて作ったものなので、Notion への保存に失敗しても画面からは消さない
+  const saveToNotion = async (transcript: string): Promise<Omit<Result, "transcript">> => {
+    setProgressLabel("Notionに保存中…");
+    try {
       const res = await fetch("/api/voice-memo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript, title }),
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
-      }
-      const data: Result = await res.json();
-      setResult(data);
-      setStatus("done");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
+      return { notionUrl: data.notionUrl };
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "不明なエラー");
-      setStatus("error");
+      console.error("Notionへの保存に失敗:", err);
+      return { notionError: err instanceof Error ? err.message : "不明なエラー" };
     }
   };
 
@@ -364,7 +371,7 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 760, margin: "0 auto", padding: "48px 28px 80px" }}>
       <h1 style={{ fontSize: 44, margin: "0 0 8px" }}>Claudio</h1>
-      <p className="text-muted" style={{ fontSize: 16, margin: "0 0 40px", maxWidth: "44ch" }}>録音 → 文字起こし → 要約 → Notionへ自動保存。</p>
+      <p className="text-muted" style={{ fontSize: 16, margin: "0 0 40px", maxWidth: "44ch" }}>録音 → 文字起こし → Notionへ自動保存。</p>
 
       {!isRecording && !isProcessing && (
         <>
@@ -504,33 +511,17 @@ export default function Home() {
           <section className="card elev-sm" style={{ padding: "26px 28px" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
               <p className="card-kicker" style={{ margin: 0 }}>📝 文字起こし</p>
-              <button onClick={() => copyToClipboard(result.transcript, "transcript")} className="btn btn-ghost" style={{ fontSize: 13 }}>
-                {copied === "transcript" ? "✓ コピー済み" : "コピー"}
+              <button onClick={() => copyToClipboard(result.transcript)} className="btn btn-ghost" style={{ fontSize: 13 }}>
+                {copied ? "✓ コピー済み" : "コピー"}
               </button>
             </div>
             <p style={{ fontSize: 15, lineHeight: 1.75, margin: 0, whiteSpace: "pre-wrap" }}>{result.transcript}</p>
           </section>
 
-          {result.summaryFailed && (
+          {result.notionError && (
             <div className="card elev-sm" style={{ background: "var(--color-accent-100)", border: "1px solid var(--color-accent-300)" }}>
-              <span style={{ fontFamily: "var(--font-heading)", color: "var(--color-accent-800)", fontSize: 14 }}>⚠️ 要約の生成に失敗しました。文字起こしのみNotionに保存されています。</span>
+              <span style={{ fontFamily: "var(--font-heading)", color: "var(--color-accent-800)", fontSize: 14 }}>⚠️ Notionへの保存に失敗しました（{result.notionError}）。文字起こしはコピーして保管してください。</span>
             </div>
-          )}
-
-          {!result.summaryFailed && (
-            <section className="card elev-sm" style={{ padding: "26px 28px" }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                <p className="card-kicker" style={{ margin: 0 }}>✨ 要約</p>
-                <button onClick={() => copyToClipboard(result.summary, "summary")} className="btn btn-ghost" style={{ fontSize: 13 }}>
-                  {copied === "summary" ? "✓ コピー済み" : "コピー"}
-                </button>
-              </div>
-              <div style={{ fontSize: 15, lineHeight: 1.75 }}>
-                {result.summary.split("\n").map((line, i) => (
-                  <p key={i} style={{ margin: "4px 0" }}>{line}</p>
-                ))}
-              </div>
-            </section>
           )}
 
           {result.notionUrl && (
