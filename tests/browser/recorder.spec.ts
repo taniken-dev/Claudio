@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import type { Sources } from "../../lib/recorder";
+import type { RecordingOptions, Sources } from "../../lib/recorder";
 
 const MIC: Sources = { mic: true, system: false, screen: false };
 const MIC_AND_SYSTEM: Sources = { mic: true, system: true, screen: false };
@@ -10,7 +10,8 @@ test.beforeEach(async ({ page }) => {
   await page.waitForFunction(() => "harness" in window);
 });
 
-const start = (page: Page, sources: Sources) => page.evaluate((s) => window.harness.start(s), sources);
+const start = (page: Page, sources: Sources, options?: RecordingOptions) =>
+  page.evaluate(([s, o]) => window.harness.start(s, o), [sources, options] as const);
 const stop = (page: Page) => page.evaluate(() => window.harness.stop());
 const events = (page: Page) => page.evaluate(() => window.harness.events);
 
@@ -116,4 +117,39 @@ test("停止を続けて呼んでも、同じ結果を返す", async ({ page }) 
   await start(page, MIC);
   await page.waitForTimeout(500);
   expect(await page.evaluate(() => window.harness.stopTwiceSame())).toBe(true);
+});
+
+test("文字起こし用に、録音を一定の長さごとに単独で再生できるファイルへ区切る", async ({ page }) => {
+  await start(page, MIC_AND_SYSTEM, { segmentMs: 2000 });
+  await page.waitForTimeout(5000);
+  const { audio, segments } = await stop(page);
+
+  // 2秒・2秒・残り約1秒の3個。区切り目で音が抜けないよう、合計は録った長さに足りる
+  expect(segments).toHaveLength(3);
+  for (const segment of segments) expect(segment.type).toContain("audio/webm");
+  expect(segments[0].duration).toBeGreaterThan(1.5);
+  expect(segments[1].duration).toBeGreaterThan(1.5);
+  expect(segments.reduce((total, s) => total + s.duration, 0)).toBeGreaterThan(4.5);
+  // 手元に保存する方は、区切らない1本のまま
+  expect(audio.duration).toBeGreaterThan(4.5);
+});
+
+test("マイクが切れて録音が止まっても、そこまでの区切りを返す", async ({ page }) => {
+  await start(page, MIC, { segmentMs: 1000 });
+  await page.waitForTimeout(2500);
+  await page.evaluate(() => window.harness.endMic());
+  await expect.poll(() => events(page)).toContainEqual(expect.objectContaining({ type: "autoStop" }));
+
+  const { segments } = await stop(page);
+  expect(segments.length).toBeGreaterThanOrEqual(2);
+  expect(segments.reduce((total, s) => total + s.duration, 0)).toBeGreaterThan(2);
+});
+
+test("破棄したら、区切り用の録音も止める", async ({ page }) => {
+  await start(page, MIC, { segmentMs: 500 });
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => window.harness.cancel());
+  await page.waitForTimeout(1200);
+  expect(await events(page)).toEqual([]);
+  expect(await page.evaluate(() => window.harness.liveTracks())).toBe(0);
 });

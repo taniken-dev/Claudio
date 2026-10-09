@@ -3,11 +3,13 @@
 import { useRef, useState, useEffect } from "react";
 import { uploadPresigned } from "@vercel/blob/client";
 import { convertToMp3, prepareAudioForWhisper, saveBlobLocally, timestampedFilename } from "@/lib/audio";
-import { beginRecording, type Recording, type RecordedVideo, type Sources } from "@/lib/recorder";
+import { SEGMENT_MS, beginRecording, type Recording, type RecordedVideo, type Sources } from "@/lib/recorder";
 
 type Status = "idle" | "recording" | "processing" | "done" | "error";
 
 const WHISPER_MAX_BYTES = 25 * 1024 * 1024;
+// 区切った録音を同時に文字起こしする数。1時間（6個）を待たせず、OpenAI のレート制限にも当たらない程度
+const TRANSCRIBE_CONCURRENCY = 3;
 const SOURCE_PREF_KEY = "claudio.audioSources";
 
 interface Result {
@@ -155,7 +157,7 @@ export default function Home() {
   };
 
   const finalizeRecording = async (recording: Recording) => {
-    const { audio: blob, video } = await recording.stop();
+    const { audio: blob, segments, video } = await recording.stop();
     const filename = timestampedFilename("webm");
     lastRecordingRef.current = { blob, filename };
 
@@ -171,7 +173,7 @@ export default function Home() {
       setSavedFilename(filename);
     }
 
-    await processAudio(blob, filename);
+    await processAudio(blob, filename, segments);
     // 変換はデコードで数百MBのメモリを使う。文字起こしと同時に走らせてタブが落ちないよう、
     // Notion 保存まで終わってから行う（webm は上で保存済みなので、変換に失敗しても録音は残る）。
     // 画面録画がある場合は同じ音声が動画に入っているので、メモリを使ってまで作らない。
@@ -273,6 +275,48 @@ export default function Home() {
     return data.text.trim();
   };
 
+  const postForTranscript = async (audio: Blob, filename: string) => {
+    const formData = new FormData();
+    formData.append("audio", audio, filename);
+    formData.append("filename", filename);
+    const res = await fetch("/api/transcribe", { method: "POST", body: formData });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
+    }
+    const data: { text: string } = await res.json();
+    return data.text.trim();
+  };
+
+  /**
+   * 録音中に区切っておいた音声を1個ずつ文字起こしする。Whisper がループしても失うのはその区間だけで、
+   * 1個が失敗しても残りは活かす（全部失敗したときだけエラーにする）。
+   */
+  const transcribeSegments = async (segments: Blob[]) => {
+    const texts: string[] = new Array(segments.length);
+    const errors: unknown[] = [];
+    let done = 0;
+    let next = 0;
+    setProgressLabel(`文字起こし中… (0/${segments.length})`);
+    const worker = async () => {
+      while (next < segments.length) {
+        const i = next++;
+        try {
+          texts[i] = await postForTranscript(segments[i], `segment-${i + 1}.webm`);
+        } catch (err) {
+          console.error(`区間${i + 1}の文字起こしに失敗:`, err);
+          errors.push(err);
+          const from = (i * SEGMENT_MS) / 60_000;
+          texts[i] = `［開始から${from}〜${from + SEGMENT_MS / 60_000}分の文字起こしに失敗しました］`;
+        }
+        setProgressLabel(`文字起こし中… (${++done}/${segments.length})`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(TRANSCRIBE_CONCURRENCY, segments.length) }, worker));
+    if (errors.length === segments.length) throw errors[0];
+    return texts.filter((t) => t).join("\n").trim();
+  };
+
   const transcribeBySplitting = async (audioBlob: Blob, sourceName: string) => {
     setProgressLabel("音声を準備中…");
     const prepared = await prepareAudioForWhisper(audioBlob, sourceName);
@@ -280,25 +324,18 @@ export default function Home() {
     for (let i = 0; i < prepared.total; i++) {
       setProgressLabel(prepared.total > 1 ? `文字起こし中… (${i + 1}/${prepared.total})` : "文字起こし中…");
       const part = prepared.get(i);
-      const formData = new FormData();
-      formData.append("audio", part.blob, part.filename);
-      formData.append("filename", part.filename);
-      const res = await fetch("/api/transcribe", { method: "POST", body: formData });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error ?? `HTTPエラー: ${res.status}`);
-      }
-      const data: { text: string } = await res.json();
-      texts.push(data.text);
+      texts.push(await postForTranscript(part.blob, part.filename));
     }
     return texts.filter((t) => t).join("\n").trim();
   };
 
-  const processAudio = async (audioBlob: Blob, sourceName: string) => {
+  /** segments は録音したときだけある。アップロードされたファイルは録音中に区切れないので丸ごと送る */
+  const processAudio = async (audioBlob: Blob, sourceName: string, segments?: Blob[]) => {
     try {
       const blobUrl = await backupToBlob(audioBlob, sourceName);
-      const transcript =
-        blobUrl && audioBlob.size <= WHISPER_MAX_BYTES
+      const transcript = segments?.length
+        ? await transcribeSegments(segments)
+        : blobUrl && audioBlob.size <= WHISPER_MAX_BYTES
           ? await transcribeFromBlob(blobUrl, sourceName)
           : await transcribeBySplitting(audioBlob, sourceName);
 

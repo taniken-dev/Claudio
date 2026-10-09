@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { get } from "@vercel/blob";
 import OpenAI from "openai";
 import { fetchWithDuplex } from "@/lib/openai-fetch";
+import { cleanTranscript } from "@/lib/transcript";
 
 // fetch を明示的に渡さないと SDK は node-fetch を使う。Vercel 上では
 // 音声アップロード中に read ECONNRESET で切断される事象が出たため、
@@ -32,8 +33,9 @@ async function transcribe(file: File): Promise<string> {
     language: "ja",
   });
 
-  console.log("[transcribe] 完了:", `${Date.now() - startedAt}ms`);
-  return transcription.text.trim();
+  const { text, looped } = cleanTranscript(transcription.text);
+  console.log("[transcribe] 完了:", `${Date.now() - startedAt}ms`, looped ? "（ループを検出して後ろを除外）" : "");
+  return text;
 }
 
 export async function POST(req: NextRequest) {

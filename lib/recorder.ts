@@ -23,9 +23,22 @@ export interface RecordedVideo {
 }
 
 export interface RecordingResult {
+  /** 手元に保存する、区切らない1本の録音 */
   audio: Blob;
+  /** 文字起こし用に一定の長さで区切った録音。1個ずつ単独で再生でき、そのまま Whisper に送れる */
+  segments: Blob[];
   video: RecordedVideo | null;
 }
+
+export interface RecordingOptions {
+  /** 文字起こし用に区切る長さ */
+  segmentMs?: number;
+}
+
+// 32kbps で10分は約2.4MB。Vercel のリクエストボディ上限（4.5MB）に余裕をもって収まり、
+// Whisper がループしても失うのはこの長さまでで済む。
+export const SEGMENT_MS = 10 * 60 * 1000;
+const AUDIO_BITS_PER_SECOND = 32000;
 
 export interface Recording {
   /** チェックボックスは希望であって保証ではない（共有ダイアログで音声を切られることがある）。実際に取れたトラックから確定した音源 */
@@ -40,7 +53,11 @@ export interface Recording {
  * getDisplayMedia は「ユーザー操作の直後」でないとブラウザに弾かれ、この操作は数秒で失効する。
  * クリックの処理から await を挟まずに呼ぶこと。
  */
-export async function beginRecording(sources: Sources, handlers: RecordingHandlers = {}): Promise<Recording> {
+export async function beginRecording(
+  sources: Sources,
+  handlers: RecordingHandlers = {},
+  { segmentMs = SEGMENT_MS }: RecordingOptions = {},
+): Promise<Recording> {
   let finished = false;
   // 停止・破棄の後に届いたトラックのイベントで、終わった録音を畳み直さないようにする
   const warn = (message: string) => { if (!finished) handlers.onWarning?.(message); };
@@ -49,7 +66,10 @@ export async function beginRecording(sources: Sources, handlers: RecordingHandle
   let audioContext: AudioContext | null = null;
   let displayStream: MediaStream | null = null;
   let micStream: MediaStream | null = null;
+  // 区切り用のレコーダーに渡す複製。元と同じく、終わったら止める
+  const clonedTracks: MediaStreamTrack[] = [];
   const release = () => {
+    clonedTracks.forEach((t) => t.stop());
     void audioContext?.close();
     audioContext = null;
     displayStream?.getTracks().forEach((t) => t.stop());
@@ -150,7 +170,7 @@ export async function beginRecording(sources: Sources, handlers: RecordingHandle
   }
 
   const audioMimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-  const audioRecorder = new MediaRecorder(streams.audio, { mimeType: audioMimeType, audioBitsPerSecond: 32000 });
+  const audioRecorder = new MediaRecorder(streams.audio, { mimeType: audioMimeType, audioBitsPerSecond: AUDIO_BITS_PER_SECOND });
   const audioChunks: Blob[] = [];
   audioRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
 
@@ -185,6 +205,37 @@ export async function beginRecording(sources: Sources, handlers: RecordingHandle
   audioRecorder.addEventListener("stop", () => autoStop("音声の入力が途切れたため、録音を終了しました。"), { once: true });
   audioRecorder.start(100);
 
+  // 文字起こし用には、保存用とは別のレコーダーで一定時間ごとに新しいファイルを録り直す。
+  // 録音全体を後からデコードして切り分けると、1時間で一時的に約3.6GBを使い、93分を超えると
+  // デコード自体が失敗するため。保存用の1本と同じトラックを共有するとブラウザによっては録れないので、複製を渡す。
+  const segmentStream = new MediaStream(streams.audio.getAudioTracks().map((t) => {
+    const clone = t.clone();
+    clonedTracks.push(clone);
+    return clone;
+  }));
+  const segments: Promise<Blob>[] = [];
+  const startSegment = () => {
+    const recorder = new MediaRecorder(segmentStream, { mimeType: audioMimeType, audioBitsPerSecond: AUDIO_BITS_PER_SECOND });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    segments.push(new Promise((resolve) => {
+      recorder.addEventListener("stop", () => resolve(new Blob(chunks, { type: recorder.mimeType })), { once: true });
+    }));
+    recorder.start(1000);
+    return recorder;
+  };
+  let segmentRecorder = startSegment();
+  const rotation = setInterval(() => {
+    // 先に次を始めてから前を止め、区切り目で音が抜けないようにする
+    const previous = segmentRecorder;
+    segmentRecorder = startSegment();
+    if (previous.state !== "inactive") previous.stop();
+  }, segmentMs);
+  const stopSegments = () => {
+    clearInterval(rotation);
+    if (segmentRecorder.state !== "inactive") segmentRecorder.stop();
+  };
+
   let stopping: Promise<RecordingResult> | null = null;
 
   return {
@@ -206,9 +257,11 @@ export async function beginRecording(sources: Sources, handlers: RecordingHandle
           }))
         : Promise.resolve(null);
       const audio = whenStopped(audioRecorder).then(() => new Blob(audioChunks, { type: audioRecorder.mimeType }));
-      stopping = Promise.all([audio, video]).then(([audio, video]) => {
+      stopSegments();
+      stopping = Promise.all([audio, Promise.all(segments), video]).then(([audio, segments, video]) => {
         release();
-        return { audio, video };
+        // 区切った直後に止めると、中身のない最後の1個ができることがある
+        return { audio, segments: segments.filter((segment) => segment.size > 0), video };
       });
       return stopping;
     },
@@ -216,6 +269,7 @@ export async function beginRecording(sources: Sources, handlers: RecordingHandle
     cancel() {
       if (finished) return;
       finished = true;
+      stopSegments();
       for (const recorder of [videoRecorder, audioRecorder]) {
         if (recorder && recorder.state !== "inactive") recorder.stop();
       }

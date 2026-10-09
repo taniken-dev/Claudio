@@ -1,6 +1,6 @@
 // lib/recorder.ts を本物の Chrome で動かすためのページ。アプリ本体は Google ログインが壁で
 // 自動テストできないので、録音の制御だけをここに載せて Playwright から操作する。
-import { beginRecording, type Recording, type Sources } from "../../../lib/recorder";
+import { beginRecording, type Recording, type RecordingOptions, type Sources } from "../../../lib/recorder";
 
 interface DisplayOptions {
   /** 共有ダイアログで「音声を共有」を外された状態を再現する */
@@ -88,11 +88,11 @@ const harness = {
   setDisplay(options: Partial<DisplayOptions>) {
     displayOptions = { ...displayOptions, ...options };
   },
-  async start(sources: Sources) {
+  async start(sources: Sources, options?: RecordingOptions) {
     recording = await beginRecording(sources, {
       onWarning: (message) => events.push({ type: "warning", message }),
       onAutoStop: (message) => events.push({ type: "autoStop", message }),
-    });
+    }, options);
     return recording.activeSources;
   },
   videoBytes: () => recording!.videoBytes(),
@@ -104,6 +104,12 @@ const harness = {
         type: result.audio.type,
         duration: result.audio.size ? await mediaDuration(result.audio, "audio") : 0,
       },
+      // 1個ずつ単独で再生できるか（= 単独で文字起こしに送れるか）を長さで確かめる
+      segments: await Promise.all(result.segments.map(async (segment) => ({
+        size: segment.size,
+        type: segment.type,
+        duration: await mediaDuration(segment, "audio"),
+      }))),
       video: result.video && {
         size: result.video.blob.size,
         extension: result.video.extension,
